@@ -1,0 +1,91 @@
+{
+  "$schema": "./access-policy.schema.json",
+  "$comment": [
+    "Per-profile access control. Point TERMIX_POLICY_FILE at a copy of this.",
+    "",
+    "A profile is selected by the bearer token on the HTTP transport, or by",
+    "TERMIX_PROFILE on stdio.",
+    "",
+    "EACH DIMENSION HAS A MODE, so you decide the scope of every restriction:",
+    "  allowlist  default deny; permits what `allow` matches (deny carves",
+    "             exceptions out of the grant).  Fails closed.",
+    "  blocklist  default allow; refuses what `deny` matches (allow carves",
+    "             exceptions back in).  Fails open.",
+    "  all        no restriction on this dimension.",
+    "  none       nothing passes.",
+    "Omit the mode and it is inferred: allowlist if you wrote `allow`, blocklist",
+    "if you wrote only `deny`, otherwise the default (hosts allowlist; tools and",
+    "paths all). Shorthand: \"hosts\": \"all\", or \"hosts\": [\"a\",\"b\"] for an",
+    "allowlist of those.",
+    "",
+    "globalBlocklist decides whether the server-wide TERMIX_BLOCKLIST still",
+    "applies to this profile: \"enforce\" (default) or \"ignore\".",
+    "",
+    "Tool groups save enumerating names: @readonly @hosts @files @files.read",
+    "@files.write @exec @docker @system @tunnels @snippets @observability @meta",
+    "@policy @escape.  Run `node scripts/policy.mjs groups` to list members.",
+    "",
+    "Check a policy before trusting it:",
+    "  node scripts/policy.mjs validate ./access-policy.json",
+    "  node scripts/policy.mjs explain  ./access-policy.json --profile ops",
+    "or, from a model, the access_policy_schema and access_policy_check tools.",
+    "",
+    "Secrets: prefer tokenEnv / termixApiKeyEnv (or tokenSha256) so this file",
+    "carries no secret and can live beside the rest of your compose config."
+  ],
+
+  "version": 1,
+  "defaultProfile": "readonly",
+
+  "profiles": {
+    "readonly": {
+      "description": "Look at anything reachable, change nothing. The safe default.",
+      "tokenEnv": "MCP_TOKEN_READONLY",
+      "hosts": "all",
+      "tools": { "allow": ["@readonly"] },
+      "mutations": "deny"
+    },
+
+    "ops": {
+      "description": "Day-to-day operations on the Docker and reverse-proxy hosts.",
+      "tokenEnv": "MCP_TOKEN_OPS",
+      "$comment": "Hosts as an allowlist: a machine added to Termix later is unreachable until granted here.",
+      "hosts": ["app-main", "10.0.0.10", "web-proxy", "dashboard", "automation"],
+      "mutations": "allow",
+      "$comment2": "Tools as a blocklist: everything except the sharp edges.",
+      "tools": { "mode": "blocklist", "deny": ["process_signal", "tunnel_action"] }
+    },
+
+    "appdata": {
+      "description": "Edit application config on one host, and nothing else.",
+      "tokenEnv": "MCP_TOKEN_APPDATA",
+      "termixApiKeyEnv": "TERMIX_API_KEY_APPDATA",
+      "hosts": ["app-main"],
+      "mutations": "allow",
+      "paths": { "allow": ["/opt/appdata/**", "/opt/compose/**"], "deny": ["/opt/compose/secrets/**"] },
+      "$comment": [
+        "@escape is denied on purpose. Path rules bind the file tools, but a",
+        "shell command reads and writes anywhere the SSH user can -- so a",
+        "path-restricted profile that keeps run_command is not path-restricted.",
+        "The server warns at startup if you leave these granted."
+      ],
+      "tools": { "mode": "blocklist", "deny": ["@escape"] }
+    },
+
+    "break-glass": {
+      "description": "Everything, including hosts the global blocklist excludes. Use deliberately.",
+      "tokenEnv": "MCP_TOKEN_BREAKGLASS",
+      "hosts": "all",
+      "globalBlocklist": "ignore",
+      "mutations": "allow"
+    },
+
+    "audit": {
+      "description": "Read the audit trail and alerts only; cannot reach a machine at all.",
+      "tokenEnv": "MCP_TOKEN_AUDIT",
+      "hosts": "none",
+      "tools": { "allow": ["@observability", "@policy", "help", "list_hosts"] },
+      "mutations": "deny"
+    }
+  }
+}

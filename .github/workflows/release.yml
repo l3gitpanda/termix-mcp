@@ -1,0 +1,256 @@
+name: Build, publish and release
+
+# The GitHub counterpart to .forgejo/workflows/release.yaml. Same shape, same
+# gates, but it publishes to GHCR using the built-in GITHUB_TOKEN, so a fork
+# needs no secret and no repository variable to get working releases.
+#
+# Images land at ghcr.io/<owner>/<repo>. A package published this way starts
+# PRIVATE and inherits the repository's access; make it public from the
+# package's settings page once you are happy for the world to pull it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out current tree
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # --ignore-scripts is safe here and asserted below: no locked package
+      # declares an install script.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run tests
+        run: node --test test/smoke.mjs test/integration.mjs test/access.mjs
+
+      # /healthz reports package.json's version, so if that file disagrees with
+      # the tag being built, every deployed instance lies about what it runs.
+      - name: On a tag build, package.json must match the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          want="${tag#v}"
+          got="$(node -p "require('./package.json').version")"
+          echo "tag ${tag} -> expects ${want}; package.json says ${got}"
+          if [ "$want" != "$got" ]; then
+            echo "Version mismatch. Set the version to ${want} in package.json, commit, and re-cut the tag."
+            exit 1
+          fi
+
+      - name: On a tag build, CHANGELOG.md must have an entry
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          node -e '
+            const fs = require("fs");
+            const version = process.argv[1].replace(/^v/, "");
+            import("./src/changelog.mjs").then(({ extractRelease }) => {
+              const body = extractRelease(fs.readFileSync("CHANGELOG.md", "utf8"), version);
+              if (!body) {
+                console.error(`CHANGELOG.md has no "## ${version}" section.`);
+                process.exit(1);
+              }
+              console.log(`changelog entry found for ${version}`);
+            });
+          ' "${GITHUB_REF_NAME}"
+
+      - name: Confirm the lockfile is complete and npm-sourced
+        # Every entry resolves to registry.npmjs.org and carries an integrity
+        # hash. This is what lets the image build with --ignore-scripts safely.
+        run: |
+          set -eu
+          node -e '
+            const lock = require("./package-lock.json");
+            const entries = Object.entries(lock.packages || {}).filter(([k]) => k);
+            const foreign = entries.filter(([, v]) => v.resolved && !v.resolved.startsWith("https://registry.npmjs.org/"));
+            const unhashed = entries.filter(([, v]) => v.resolved && !v.integrity);
+            if (foreign.length) { console.error("non-npmjs sources:", foreign.map(([k]) => k)); process.exit(1); }
+            if (unhashed.length) { console.error("missing integrity:", unhashed.map(([k]) => k)); process.exit(1); }
+            console.log(`${entries.length} locked packages, all npmjs, all hashed`);
+          '
+
+  image:
+    needs: test
+    # A PR must not be able to publish an image to a registry production pulls from.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.tags.outputs.image }}
+      short: ${{ steps.tags.outputs.short }}
+    steps:
+      - name: Check out current tree
+        uses: actions/checkout@v4
+
+      - name: Work out the image name and tags
+        id: tags
+        # GHCR rejects uppercase, and a repository name is free to contain it,
+        # so the owner/repo pair is lowercased rather than trusted.
+        run: |
+          set -eu
+          image="${REGISTRY}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          short="$(echo "${GITHUB_SHA}" | cut -c1-12)"
+          tags="${image}:sha-${short}"
+          case "${GITHUB_REF}" in
+            refs/tags/v*)
+              version="${GITHUB_REF_NAME}"
+              tags="${tags} ${image}:${version} ${image}:${version#v} ${image}:latest"
+              echo "version=${version}" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              tags="${tags} ${image}:main"
+              ;;
+          esac
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "short=${short}" >> "$GITHUB_OUTPUT"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "Tags: ${tags}"
+
+      - name: Log in to the container registry
+        run: |
+          set -eu
+          printf '%s' "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login "${REGISTRY}" -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Reuse the published image if this commit is already built
+        id: cached
+        run: |
+          set -eu
+          existing="${{ steps.tags.outputs.image }}:sha-${{ steps.tags.outputs.short }}"
+          if docker manifest inspect "$existing" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "$existing already published; pulling and re-tagging instead of rebuilding"
+            docker pull -q "$existing"
+            for tag in ${{ steps.tags.outputs.tags }}; do
+              [ "$tag" = "$existing" ] || docker tag "$existing" "$tag"
+            done
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            echo "no image for this commit yet; building"
+          fi
+
+      - name: Build the image
+        if: steps.cached.outputs.hit != 'true'
+        run: |
+          set -eu
+          image="${{ steps.tags.outputs.image }}"
+          docker pull -q "${image}:main" 2>/dev/null || echo "no :main image to warm the cache from"
+          args=""
+          for tag in ${{ steps.tags.outputs.tags }}; do args="$args -t $tag"; done
+          labels="--label org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          labels="$labels --label org.opencontainers.image.revision=${GITHUB_SHA}"
+          labels="$labels --label org.opencontainers.image.version=${{ steps.tags.outputs.version || steps.tags.outputs.short }}"
+          export DOCKER_BUILDKIT=1
+          # shellcheck disable=SC2086
+          docker build $args --cache-from "${image}:main" --build-arg BUILDKIT_INLINE_CACHE=1 $labels .
+
+      - name: Smoke-test the built image
+        if: steps.cached.outputs.hit != 'true'
+        run: |
+          set -eu
+          # No config is supplied, so the entrypoint must fail closed at config
+          # validation rather than boot half-configured.
+          out="$(docker run --rm --entrypoint node \
+                   "${{ steps.tags.outputs.image }}:sha-${{ steps.tags.outputs.short }}" \
+                   -e 'import("./src/config.mjs").then(m => { try { m.loadConfig("http"); console.log("UNEXPECTED:started") } catch (e) { console.log("EXPECTED:" + e.message) } })' 2>&1)" || true
+          echo "$out"
+          case "$out" in
+            *"EXPECTED:missing required environment variable"*)
+              echo "image boots and fails closed without configuration" ;;
+            *)
+              echo "image did not fail closed on a missing configuration; refusing to publish"
+              exit 1 ;;
+          esac
+
+      - name: Push every tag
+        run: |
+          set -eu
+          for tag in ${{ steps.tags.outputs.tags }}; do
+            echo "pushing $tag"
+            docker push "$tag"
+          done
+
+      - name: Always log out
+        if: always()
+        run: docker logout "${REGISTRY}" || true
+
+  release:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out current tree
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Build the release payloads
+        run: |
+          set -eu
+          mkdir -p .release
+          cp deploy/docker-compose.yml .release/docker-compose.yml
+          cp .env.example .release/env.example
+          # git archive, not tar of the working tree: this asset is published,
+          # and an exclude list can only omit what someone remembered. Archiving
+          # the commit means an untracked .env, data/ or audit.jsonl left in the
+          # workspace physically cannot be shipped.
+          git archive --format=tar.gz -o .release/termix-mcp-src.tar.gz HEAD
+          ls -l .release
+
+      - name: Render the release body from CHANGELOG.md
+        run: |
+          set -eu
+          node scripts/release-body.mjs \
+            "${GITHUB_REF_NAME}" \
+            "${{ needs.image.outputs.image }}" \
+            "${{ needs.image.outputs.short }}" > "${RUNNER_TEMP}/release-body.md"
+          cat "${RUNNER_TEMP}/release-body.md"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          # Idempotent on purpose: re-running a tag build must update the notes
+          # and assets rather than fail on an existing release.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release ${tag} exists; updating notes and assets"
+            gh release edit "$tag" --notes-file "${RUNNER_TEMP}/release-body.md"
+            gh release upload "$tag" \
+              .release/docker-compose.yml .release/env.example .release/termix-mcp-src.tar.gz \
+              --clobber
+          else
+            gh release create "$tag" --title "$tag" --notes-file "${RUNNER_TEMP}/release-body.md" \
+              .release/docker-compose.yml .release/env.example .release/termix-mcp-src.tar.gz
+            echo "created release ${tag}"
+          fi

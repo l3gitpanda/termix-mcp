@@ -1,0 +1,11 @@
+node_modules/
+.env
+data/
+*.log
+audit.jsonl*
+.release/
+
+# The live access policy. Structure carries no secrets (tokens are referenced
+# by env var name), but it enumerates the estate, so it is deliberately not
+# committed -- access-policy.example.json is the tracked template.
+access-policy.json

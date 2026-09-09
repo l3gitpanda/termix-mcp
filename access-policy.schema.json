@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/termix-mcp/access-policy.schema.json",
+  "title": "termix-mcp access policy",
+  "description": "Defines named access profiles for termix-mcp. A profile is selected by bearer token (HTTP transport) or by TERMIX_PROFILE (stdio), and scopes which machines a caller may reach, whether it may write, which tools it may call, and which paths it may touch.",
+  "type": "object",
+  "required": ["profiles"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "$comment": { "$ref": "#/$defs/comment" },
+    "version": { "type": "integer", "const": 1, "description": "Policy format version." },
+    "defaultProfile": {
+      "type": "string",
+      "description": "Profile used by the stdio transport when TERMIX_PROFILE is unset. Must name a defined profile."
+    },
+    "profiles": {
+      "type": "object",
+      "description": "Named profiles. The key is the profile name used by TERMIX_PROFILE and shown in audit records.",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[A-Za-z0-9_.-]+$" },
+      "additionalProperties": { "$ref": "#/$defs/profile" }
+    }
+  },
+
+  "$defs": {
+    "comment": {
+      "description": "Free-form notes. Ignored by the server.",
+      "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }]
+    },
+
+    "mode": {
+      "type": "string",
+      "enum": ["allowlist", "blocklist", "all", "none"],
+      "description": "How this dimension is scoped. 'allowlist' denies by default and permits only what `allow` matches (deny carves exceptions out) — fails closed. 'blocklist' permits by default and refuses what `deny` matches (allow carves exceptions back in) — fails open. 'all' applies no restriction. 'none' refuses everything. If omitted, the mode is inferred: allowlist when `allow` is non-empty, blocklist when only `deny` is, otherwise the dimension's default (hosts: allowlist, tools and paths: all)."
+    },
+
+    "ruleSet": {
+      "description": "A rule set may be written three ways: the string \"all\"/\"none\"/\"allowlist\"/\"blocklist\"; an array, which is shorthand for an allowlist of those patterns; or an object with mode/allow/deny.",
+      "oneOf": [
+        { "$ref": "#/$defs/mode" },
+        { "type": "array", "items": { "type": "string" } },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "$comment": { "$ref": "#/$defs/comment" },
+            "mode": { "$ref": "#/$defs/mode" },
+            "allow": { "type": "array", "items": { "type": "string" } },
+            "deny": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      ]
+    },
+
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "$comment": { "$ref": "#/$defs/comment" },
+        "description": {
+          "type": "string",
+          "description": "What this profile is for. Shown by the help tool, so write it for whoever reads it later."
+        },
+
+        "token": {
+          "type": "string",
+          "description": "Bearer token selecting this profile on the HTTP transport. Prefer tokenEnv or tokenSha256 so the policy file itself carries no secret."
+        },
+        "tokenEnv": {
+          "type": "string",
+          "description": "Name of an environment variable holding the bearer token."
+        },
+        "tokenSha256": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "description": "SHA-256 hex digest of the bearer token."
+        },
+
+        "termixApiKey": {
+          "type": "string",
+          "description": "Termix API key used for this profile instead of the global one, so Termix's own host ownership enforces the same limits at the source. Prefer termixApiKeyEnv."
+        },
+        "termixApiKeyEnv": {
+          "type": "string",
+          "description": "Name of an environment variable holding this profile's Termix API key."
+        },
+
+        "mutations": {
+          "type": "string",
+          "enum": ["allow", "deny"],
+          "default": "allow",
+          "description": "'deny' pins the profile read-only; toggle_state cannot lift it."
+        },
+        "globalBlocklist": {
+          "type": "string",
+          "enum": ["enforce", "ignore"],
+          "default": "enforce",
+          "description": "Whether the server-wide TERMIX_BLOCKLIST still applies to this profile. 'ignore' lets a profile reach hosts excluded globally, and is warned about at startup."
+        },
+
+        "hosts": {
+          "$ref": "#/$defs/ruleSet",
+          "description": "Which machines this profile may reach. Patterns match a host's NAME or its IP, case-insensitively; '*' is a wildcard. Defaults to allowlist, so a host added to Termix later is unreachable until granted. Use \"all\" to leave machines unrestricted."
+        },
+        "tools": {
+          "$ref": "#/$defs/ruleSet",
+          "description": "Which tools this profile may call. Patterns are tool names with '*' wildcards, or a group: @readonly, @hosts, @files, @files.read, @files.write, @exec, @docker, @system, @tunnels, @snippets, @observability, @meta, @escape. Defaults to unrestricted."
+        },
+        "paths": {
+          "$ref": "#/$defs/ruleSet",
+          "description": "Which filesystem paths the file tools may touch. Paths are canonicalized before matching, so traversal cannot escape a grant. '*' stays within one segment, '**' crosses separators, and a bare prefix covers its subtree. Defaults to unrestricted. NOTE: path rules only bind the file tools — a profile that also grants @escape (run_command, find_file, run_snippet, call_api) is not truly path-restricted."
+        }
+      }
+    }
+  }
+}

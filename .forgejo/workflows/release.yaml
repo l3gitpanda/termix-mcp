@@ -1,0 +1,323 @@
+name: Build, publish and release
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Set a REGISTRY repository variable to your registry host -- a Forgejo
+  # instance doubles as one, and ghcr.io works too. The image path follows
+  # ${owner}/${repo}, so a fork needs no other edit. Left as a placeholder on
+  # purpose: a clone must not push images anywhere by accident, and the
+  # preflight below fails loudly while it is unset.
+  #
+  # Prefer reaching the registry through a TLS reverse proxy rather than the
+  # registry's plain-HTTP origin port -- then no daemon needs an
+  # insecure-registries entry. Registry hosts must be lowercase.
+  REGISTRY: ${{ vars.REGISTRY || 'registry.example.com' }}
+  IMAGE: ${{ vars.REGISTRY || 'registry.example.com' }}/${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: docker
+    container:
+      image: node:24-bookworm
+    steps:
+      - name: Check out current tree
+        uses: https://data.forgejo.org/actions/checkout@v6
+
+      # Unlike the template this job was ported from, these
+      # tests are NOT dependency-free: the integration test drives the real tool
+      # modules, which import zod and the MCP SDK. Without this the run dies with
+      # ERR_MODULE_NOT_FOUND before a single assertion executes.
+      # --ignore-scripts is safe here and asserted below: no locked package
+      # declares an install script.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run tests
+        run: node --test test/smoke.mjs test/integration.mjs test/access.mjs
+
+      # /healthz reports package.json's version, so if that file disagrees with
+      # the tag being built, every deployed instance lies about what it runs.
+      - name: On a tag build, package.json must match the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          tag="${{ github.ref_name }}"
+          want="${tag#v}"
+          got="$(node -p "require('./package.json').version")"
+          echo "tag ${tag} -> expects ${want}; package.json says ${got}"
+          if [ "$want" != "$got" ]; then
+            echo "Version mismatch. Set \"version\": \"${want}\" in package.json, commit, and re-cut the tag."
+            exit 1
+          fi
+
+      - name: On a tag build, CHANGELOG.md must have an entry
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          node -e '
+            const fs = require("fs");
+            const version = process.argv[1].replace(/^v/, "");
+            import("./src/changelog.mjs").then(({ extractRelease }) => {
+              const body = extractRelease(fs.readFileSync("CHANGELOG.md", "utf8"), version);
+              if (!body) {
+                console.error(`CHANGELOG.md has no "## ${version}" section.`);
+                process.exit(1);
+              }
+              console.log(`changelog entry found for ${version}, ${body.split("\n").length} lines`);
+            });
+          ' "${{ github.ref_name }}"
+
+      - name: Confirm the lockfile is complete and npm-sourced
+        # Every entry resolves to registry.npmjs.org and carries an integrity
+        # hash. This is what lets the image build with --ignore-scripts safely.
+        run: |
+          set -eu
+          node -e '
+            const lock = require("./package-lock.json");
+            const entries = Object.entries(lock.packages || {}).filter(([k]) => k);
+            const foreign = entries.filter(([, v]) => v.resolved && !v.resolved.startsWith("https://registry.npmjs.org/"));
+            const unhashed = entries.filter(([, v]) => v.resolved && !v.integrity);
+            if (foreign.length) { console.error("non-npmjs sources:", foreign.map(([k]) => k)); process.exit(1); }
+            if (unhashed.length) { console.error("missing integrity:", unhashed.map(([k]) => k)); process.exit(1); }
+            console.log(`${entries.length} locked packages, all npmjs, all hashed`);
+          '
+
+  image:
+    needs: test
+    # A PR must not be able to publish an image to a registry production pulls from.
+    if: github.event_name != 'pull_request'
+    runs-on: docker
+    container:
+      image: node:24-bookworm
+    steps:
+      - name: Check out current tree
+        uses: https://data.forgejo.org/actions/checkout@v6
+
+      - name: Ensure a Docker CLI is available
+        run: |
+          set -eu
+          if command -v docker >/dev/null 2>&1; then
+            echo "docker already present: $(docker --version)"
+            exit 0
+          fi
+          ver=27.5.1
+          url="https://download.docker.com/linux/static/stable/x86_64/docker-${ver}.tgz"
+          ok=""
+          for attempt in 1 2 3; do
+            if curl -fsSL --connect-timeout 15 --max-time 180 -o /tmp/docker.tgz "$url"; then ok=1; break; fi
+            echo "attempt ${attempt} failed; retrying in 5s"
+            sleep 5
+          done
+          if [ -z "$ok" ]; then
+            echo "Could not fetch the static Docker client from download.docker.com after 3 tries."
+            exit 1
+          fi
+          tar -xzf /tmp/docker.tgz -C /tmp docker/docker
+          install -m 0755 /tmp/docker/docker /usr/local/bin/docker
+          docker --version
+          bx=v0.19.3
+          plugins="${HOME:-/root}/.docker/cli-plugins"
+          mkdir -p "$plugins"
+          if curl -fsSL --connect-timeout 15 --max-time 180 -o "$plugins/docker-buildx" \
+               "https://github.com/docker/buildx/releases/download/${bx}/buildx-${bx}.linux-amd64"; then
+            chmod +x "$plugins/docker-buildx"
+            docker buildx version || echo "buildx installed but not runnable; will use the classic builder"
+          else
+            echo "buildx download failed; will use the classic builder"
+          fi
+
+      - name: Preflight the daemon and the registry token
+        env:
+          TOKEN: ${{ secrets.PACKAGERUNNER_TOKEN }}
+        run: |
+          set -eu
+          if ! docker info >/dev/null 2>&1; then
+            echo "No Docker daemon is reachable from this job. This workflow expects the"
+            echo "runner to mount /var/run/docker.sock into every job container; if that has"
+            echo "stopped, re-enable it in the runner config and restart the runner."
+            exit 1
+          fi
+          echo "daemon ok: $(docker version --format '{{.Server.Version}}')"
+          if [ "${REGISTRY}" = "registry.example.com" ]; then
+            echo "REGISTRY is still the placeholder, so there is nowhere to publish. Add a"
+            echo "repository variable named REGISTRY holding your registry host, for example"
+            echo "git.example.com or ghcr.io."
+            exit 1
+          fi
+          if [ -z "${TOKEN:-}" ]; then
+            echo "PACKAGERUNNER_TOKEN is not set for this repository. Forgejo's automatic Actions"
+            echo "token cannot write packages. Create a user access token with package read/write"
+            echo "scope and add it as a repository secret named PACKAGERUNNER_TOKEN."
+            exit 1
+          fi
+
+      - name: Work out the tags
+        id: tags
+        run: |
+          set -eu
+          short="$(echo "${{ github.sha }}" | cut -c1-12)"
+          tags="${IMAGE}:sha-${short}"
+          if case "${{ github.ref }}" in refs/tags/*) true ;; *) false ;; esac then
+            version="${{ github.ref_name }}"
+            tags="${tags} ${IMAGE}:${version} ${IMAGE}:${version#v} ${IMAGE}:latest"
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+          else
+            tags="${tags} ${IMAGE}:main"
+          fi
+          echo "short=${short}" >> "$GITHUB_OUTPUT"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "Tags: ${tags}"
+
+      - name: Log in to the container registry
+        env:
+          TOKEN: ${{ secrets.PACKAGERUNNER_TOKEN }}
+        run: |
+          set -eu
+          printf '%s' "$TOKEN" | docker login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
+
+      - name: Reuse the published image if this commit is already built
+        id: cached
+        run: |
+          set -eu
+          existing="${IMAGE}:sha-${{ steps.tags.outputs.short }}"
+          if docker manifest inspect "$existing" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "$existing already published; pulling and re-tagging instead of rebuilding"
+            docker pull -q "$existing"
+            for tag in ${{ steps.tags.outputs.tags }}; do
+              [ "$tag" = "$existing" ] || docker tag "$existing" "$tag"
+            done
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            echo "no image for this commit yet; building"
+          fi
+
+      - name: Build the image
+        if: steps.cached.outputs.hit != 'true'
+        run: |
+          set -eu
+          docker pull -q "${IMAGE}:main" 2>/dev/null || echo "no :main image to warm the cache from"
+          args=""
+          for tag in ${{ steps.tags.outputs.tags }}; do args="$args -t $tag"; done
+          labels="--label org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+          labels="$labels --label org.opencontainers.image.revision=${{ github.sha }}"
+          labels="$labels --label org.opencontainers.image.version=${{ steps.tags.outputs.version || steps.tags.outputs.short }}"
+          if docker buildx version >/dev/null 2>&1; then
+            echo "building with BuildKit"
+            export DOCKER_BUILDKIT=1
+            # shellcheck disable=SC2086
+            docker build $args --cache-from "${IMAGE}:main" --build-arg BUILDKIT_INLINE_CACHE=1 $labels .
+          else
+            echo "buildx absent; building with the classic builder"
+            export DOCKER_BUILDKIT=0
+            # shellcheck disable=SC2086
+            docker build $args --cache-from "${IMAGE}:main" $labels .
+          fi
+
+      - name: Smoke-test the built image
+        if: steps.cached.outputs.hit != 'true'
+        run: |
+          set -eu
+          # No config is supplied, so the entrypoint must fail closed at config
+          # validation rather than boot half-configured.
+          out="$(docker run --rm --entrypoint node "${IMAGE}:sha-${{ steps.tags.outputs.short }}" \
+                   -e 'import("./src/config.mjs").then(m => { try { m.loadConfig("http"); console.log("UNEXPECTED:started") } catch (e) { console.log("EXPECTED:" + e.message) } })' 2>&1)" || true
+          echo "$out"
+          case "$out" in
+            *"EXPECTED:missing required environment variable"*)
+              echo "image boots and fails closed without configuration" ;;
+            *ERR_MODULE_NOT_FOUND*|*"Cannot find package"*)
+              echo "a dependency did not survive into the runtime image"; exit 1 ;;
+            *)
+              echo "unexpected startup behaviour; refusing to publish"; exit 1 ;;
+          esac
+
+      - name: Push every tag
+        run: |
+          set -eu
+          for tag in ${{ steps.tags.outputs.tags }}; do
+            echo "pushing $tag"
+            docker push "$tag"
+          done
+
+      - name: Always log out
+        if: always()
+        run: docker logout "${REGISTRY}" || true
+
+  release:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: docker
+    container:
+      image: node:24-bookworm
+    steps:
+      - name: Check out current tree
+        uses: https://data.forgejo.org/actions/checkout@v6
+
+      - name: Build the release payloads
+        run: |
+          set -eu
+          mkdir -p .release
+          cp deploy/docker-compose.yml .release/docker-compose.yml
+          cp .env.example .release/env.example
+          # git archive, not tar of the working tree: this asset is published,
+          # and an exclude list can only omit what someone remembered. Archiving
+          # the commit means an untracked .env, data/ or audit.jsonl left in the
+          # workspace physically cannot be shipped.
+          git archive --format=tar.gz -o .release/termix-mcp-src.tar.gz HEAD
+          ls -l .release
+
+      - name: Publish the release
+        env:
+          TOKEN: ${{ secrets.PACKAGERUNNER_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          api="${{ github.server_url }}/api/v1/repos/${{ github.repository }}"
+          tag="${{ github.ref_name }}"
+          auth="Authorization: token $TOKEN"
+          short="$(echo "${{ github.sha }}" | cut -c1-12)"
+          node scripts/release-body.mjs "${{ github.ref_name }}" "${IMAGE}" "$short" > /tmp/release-body.md
+          json_body="$(node -e 'process.stdout.write(JSON.stringify(require("fs").readFileSync("/tmp/release-body.md","utf8")))')"
+          id="$(curl -sS -H "$auth" "${api}/releases/tags/${tag}" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const j=JSON.parse(d);process.stdout.write(String(j.id||''))}catch(e){process.stdout.write('')}})")"
+          if [ -z "$id" ]; then
+            id="$(curl -sS -X POST -H "$auth" -H 'Content-Type: application/json' \
+              -d "{\"tag_name\":\"${tag}\",\"target_commitish\":\"${{ github.sha }}\",\"name\":\"${tag}\",\"body\":${json_body}}" \
+              "${api}/releases" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const j=JSON.parse(d);process.stdout.write(String(j.id||''))}catch(e){process.stdout.write('')}})")"
+            echo "created release ${tag} (id ${id:-none})"
+          else
+            curl -sS -o /dev/null -X PATCH -H "$auth" -H 'Content-Type: application/json' \
+              -d "{\"name\":\"${tag}\",\"body\":${json_body}}" "${api}/releases/${id}"
+            echo "updated existing release ${tag} (id ${id})"
+          fi
+          if [ -z "$id" ]; then
+            echo "Could not create or find the ${tag} release; the token most likely lacks release write scope."
+            exit 1
+          fi
+          existing="$(curl -sS -H "$auth" "${api}/releases/${id}/assets")"
+          status=0
+          for file in docker-compose.yml env.example termix-mcp-src.tar.gz; do
+            old="$(printf '%s' "$existing" | node -e "let d='';const want=process.argv[1];process.stdin.on('data',c=>d+=c).on('end',()=>{try{for(const a of JSON.parse(d)||[]){if(a.name===want){process.stdout.write(String(a.id));return}}}catch(e){}process.stdout.write('')})" "$file")"
+            if [ -n "$old" ]; then
+              curl -sS -o /dev/null -X DELETE -H "$auth" "${api}/releases/${id}/assets/${old}"
+            fi
+            code="$(curl -sS -o /tmp/asset.out -w '%{http_code}' -X POST -H "$auth" \
+              -F "attachment=@.release/${file}" "${api}/releases/${id}/assets?name=${file}")"
+            case "$code" in
+              20*) echo "attached ${file} ($code)" ;;
+              *)   echo "FAILED to attach ${file} ($code)"; cat /tmp/asset.out; status=1 ;;
+            esac
+          done
+          echo "Release: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${tag}"
+          exit "$status"

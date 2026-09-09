@@ -1,0 +1,16 @@
+# The build context is uploaded to the daemon in full, so keep secrets and the
+# audit trail out of it even though the Dockerfile copies only named paths.
+.git
+.github
+.forgejo
+node_modules
+data
+*.log
+audit.jsonl*
+.env
+.env.*
+!.env.example
+.release
+test
+# scripts/ IS copied on purpose: verify-live.mjs is how you diagnose a deployed
+# container's connection to Termix from inside it.

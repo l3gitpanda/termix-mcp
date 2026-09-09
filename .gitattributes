@@ -1,0 +1,4 @@
+# Normalize to LF so the repo is byte-identical regardless of who checks it out.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

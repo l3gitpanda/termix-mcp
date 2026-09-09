@@ -1,0 +1,47 @@
+name: Backfill release notes
+
+# Manual only. It rewrites published, externally-visible text, so it should never
+# be something a push can trigger by accident. The release job already writes the
+# changelog section into every release it cuts; this is the repair path for
+# releases published before an entry existed or edited after the fact.
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Write the changes (leave false for a dry run)'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  backfill:
+    runs-on: docker
+    container:
+      image: node:24-bookworm
+    steps:
+      - name: Check out current tree
+        uses: https://data.forgejo.org/actions/checkout@v6
+
+      - name: Rewrite release bodies from CHANGELOG.md
+        env:
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          # The same secret the release job uses. The automatic Actions token
+          # cannot write releases reliably here, which is why this is not
+          # secrets.GITHUB_TOKEN.
+          TOKEN: ${{ secrets.PACKAGERUNNER_TOKEN || secrets.GITHUB_TOKEN }}
+          # Same placeholder rule as the release workflow: set a REGISTRY
+          # repository variable. Only used to render the pull line in bodies.
+          IMAGE: ${{ vars.REGISTRY || 'registry.example.com' }}/${{ github.repository }}
+          APPLY: ${{ inputs.apply == 'true' && '1' || '0' }}
+        run: |
+          set -eu
+          if [ -z "${TOKEN:-}" ]; then
+            echo "No token available. Add a PACKAGERUNNER_TOKEN repository secret"
+            echo "with release write scope -- the same one the release job uses."
+            exit 1
+          fi
+          node scripts/backfill-releases.mjs

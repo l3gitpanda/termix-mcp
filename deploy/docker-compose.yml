@@ -1,0 +1,166 @@
+# MCP server for Termix: lets an AI agent list hosts, run commands, read and
+# write files, and control Docker and systemd through Termix.
+#
+# ⚠ If you sync compose files from a separate GitOps repository, treat THIS file
+# as a reference copy and deploy from that repository instead -- otherwise an
+# edit here is silently reverted on the next sync, and the two drift apart. A
+# drifted copy is the dangerous kind: it can quietly drop `read_only: true` or
+# move audit.jsonl out from under the SIEM's bind mount, ending log ingestion
+# while every deploy still reports success.
+#
+# BEFORE THE FIRST DEPLOY, four things must already be true, or the deploy
+# fails -- or worse, starts and cannot reach anything:
+#
+#   1. The env_file below exists, mode 600, root-owned.
+#      Compose resolves env_file at parse time, so a missing file fails the sync
+#      with "env file ... not found" before anything runs.
+#      Template: .env.example in the termix-mcp repository. It must set at least
+#      TERMIX_BASE_URL, TERMIX_API_KEY, and MCP_HTTP_TOKEN, plus one token per
+#      profile referenced by the access policy (MCP_TOKEN_READONLY, ...).
+#
+#      TERMIX_BASE_URL is the one value worth checking: the internal port the
+#      Termix API is served on is not always documented. Run
+#      `npm run verify-live` from the termix-mcp repo first -- it probes for the
+#      working origin. Guessing here produces a container that starts healthy
+#      and fails every tool call.
+#
+#      MCP_HTTP_TOKEN is required by config validation even when an access
+#      policy is in use, where the per-profile tokens are what actually select
+#      access and MCP_HTTP_TOKEN goes unused. Set it to a strong value anyway.
+#
+#   2. /var/log/termix-mcp exists and is writable by uid 10001:
+#        install -d -o 10001 -g 10001 -m 750 /var/log/termix-mcp
+#      See the volumes section for why this lives under /var/log.
+#
+#   3. /opt/termix-mcp/config/access-policy.json exists (mode 644 is fine; it
+#      holds no secrets if it references tokens via tokenEnv). This is what
+#      restricts which machines the agent may touch. Validate it before
+#      deploying: `node scripts/policy.mjs validate ./access-policy.json`.
+#        install -d -m 755 /opt/termix-mcp/config
+#      A missing file here is the nastier failure: Docker would create a
+#      DIRECTORY at a bind-mounted file path, so the whole config directory is
+#      mounted instead and a missing policy fails loudly at startup.
+#
+#   4. Host port 8099 is free. No other stack in this repository claims it,
+#      which does not cover anything started outside your GitOps flow.
+#      Confirm with `ss -ltnp | grep 8099` on the Docker host.
+#
+# Register with MANUAL sync, not the 5-minute auto-sync: the README's rule for
+# secrets-bearing stacks, and this one can execute commands on real servers.
+name: termix-mcp
+
+services:
+  termix-mcp:
+    # :latest moves only when a v* tag is cut, not on every push to main, so it
+    # still means "a deliberate release". Every build also publishes an
+    # immutable :sha-<12> tag; pin to one of those to freeze or roll back.
+    # Prefer a TLS reverse proxy in front of the registry over its plain-HTTP
+    # origin, so no daemon needs an insecure-registries entry.
+    #
+    # Set MCP_IMAGE in the .env beside this file to your own published image.
+    image: ${MCP_IMAGE:-registry.example.com/OWNER/termix-mcp:latest}
+    # Required with a moving tag: Compose will reuse an already-present image
+    # for a tag it has seen before, so without this a redeploy can silently keep
+    # running the old build while reporting success.
+    pull_policy: always
+    container_name: termix-mcp
+    # The process is already non-root (uid 10001 from the Dockerfile), so these
+    # cost nothing and close the escalation paths that remain.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # The only thing this container writes is the audit log, which is a bind
+    # mount, so the image itself can be immutable. If it ever fails to start
+    # with a read-only-filesystem error, dropping these two lines is the fix.
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 256m
+    pids_limit: 128
+    restart: unless-stopped
+    env_file:
+      - /opt/termix-mcp/secrets/termix-mcp.env
+    environment:
+      NODE_ENV: production
+      TZ: America/Los_Angeles
+      HTTP_BIND: "0.0.0.0"
+      HTTP_PORT: "8080"
+      DATA_DIR: /data
+      LOG_LEVEL: info
+      # Ceiling on ONE HTTP call to the Termix API, default 20s. This is the
+      # METADATA clock: connect, writeFile, changePermissions, list_files,
+      # read_file, every Docker and host call. GETs retry twice on a timeout, so
+      # the worst case a hung read costs is roughly three times this value --
+      # which is the reason to keep it small. Mutations are dispatched with
+      # retry 0 and are never blind-retried, so no command can be run twice by
+      # it.
+      #
+      # This used to bound command execution too, so the only way to let an apt
+      # install finish was to give every metadata call the same four minutes.
+      # TERMIX_EXEC_TIMEOUT_MS below now carries that alone.
+      #
+      # 20000 is the value to run here. It is left at 240000 only so an
+      # in-place upgrade does not change behaviour before the operator has
+      # looked; lower it once TERMIX_EXEC_TIMEOUT_MS is set.
+      TERMIX_TIMEOUT_MS: "240000"
+      # Ceiling on the executeFile call alone, default 240000 (4 minutes) --
+      # the one call that waits on the remote command rather than on Termix.
+      # run_command has no native endpoint: it writes a temp script, chmods it,
+      # calls executeFile, and deletes it. A 20s cap failed every apt install
+      # and every service restart with a long TimeoutStartSec, returning
+      # "request timed out after 20000ms" for work that had actually succeeded.
+      #
+      # The remote process keeps running to completion after this fires; the
+      # timeout abandons the HTTP call, not the command.
+      #
+      # Keep it under TERMIX_SESSION_IDLE_MS (default 300000). The idle sweep
+      # now skips sessions with work in flight and lastActive is re-stamped when
+      # a call finishes, so that ordering is a backstop rather than the only
+      # guard -- but a value above the idle window still means a reconnect
+      # mid-command if the in-flight signal is ever lost.
+      TERMIX_EXEC_TIMEOUT_MS: "240000"
+      # Per-profile access control: which machines each token may reach, whether
+      # it may write, which tools it may call, and which paths it may touch.
+      # Without this the only host restriction is TERMIX_BLOCKLIST.
+      TERMIX_POLICY_FILE: /config/access-policy.json
+      # Consider TERMIX_ALLOW_TOGGLE=false here. It pins the server read-only
+      # for its whole life, so writes cannot be enabled at runtime -- the right
+      # posture for an always-on instance nobody is watching. Left at the
+      # default because the access policy's per-profile "mutations": "deny" is
+      # the finer-grained control; this is the blunt one.
+      #
+      # The reverse proxy's address. Without it every request arrives from the
+      # proxy as far as this server can tell, so the app log and every audit
+      # record attribute all activity to that one address and two holders of a
+      # token cannot be distinguished -- which is the first question asked when
+      # a token leaks. Set it to the proxy's address, and ONLY to hosts that really
+      # do front this service: the header is believed from these addresses.
+      # Empty by default -- trust nobody and record the socket peer.
+      TERMIX_TRUSTED_PROXIES: ${TERMIX_TRUSTED_PROXIES:-}
+    ports:
+      # Bind an explicit address rather than 0.0.0.0 on purpose: if the host is
+      # ever re-IPed the container fails loudly instead of quietly listening on
+      # an address nobody expects. Only MCP clients need to reach this, so the
+      # default is loopback -- set MCP_BIND_ADDR to this host's LAN address to
+      # publish it to the network.
+      - "${MCP_BIND_ADDR:-127.0.0.1}:8099:8080"
+    volumes:
+      # audit.jsonl -- the record of every command the agent ran, every file it
+      # touched, and every refusal. A BIND, not a named volume, and deliberately
+      # under /var/log rather than /opt: a wazuh-agent stack commonly mounts
+      # /var/log:/host/var/log:ro already, so the agent can
+      # tail this file with no change to that stack. Under /opt it would be
+      # invisible to the SIEM. A named volume would additionally mean the trail
+      # could not be read without `docker exec` and would be destroyed by
+      # `docker compose down -v`.
+      #
+      # To ship it, add to the Wazuh agent's ossec.conf:
+      #   <localfile>
+      #     <log_format>json</log_format>
+      #     <location>/host/var/log/termix-mcp/audit.jsonl</location>
+      #   </localfile>
+      - /var/log/termix-mcp:/data
+      # Read-only: the access policy is operator-controlled configuration, and
+      # nothing in the container has any business rewriting its own permissions.
+      - /opt/termix-mcp/config:/config:ro
