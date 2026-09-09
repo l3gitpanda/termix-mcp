@@ -308,12 +308,23 @@ token Actions already provides. Note that a package published this way starts
 **private** — make it public from the package's settings page if you want others
 to pull it.
 
-**On Forgejo** the registry defaults to the instance the workflow is running on,
-since a Forgejo instance doubles as a container registry. The image lands at
-`<your-forge>/<owner>/<repo>` with nothing to configure. Set a `REGISTRY`
-repository variable only to publish somewhere else — and note it is read in a
-job step rather than a workflow-level `env:`, because the `vars` context is not
-reliably populated there and yields an empty string when it is not.
+**On Forgejo** the registry is taken from a `REGISTRY` repository variable, then
+a `REGISTRY` repository secret, then the forge the workflow runs on — first
+non-empty wins. Set one of the first two to the public name your registry is
+reachable at, e.g. `git.example.com`.
+
+Two things make this fiddlier than it looks, and both are why the fallback
+chain exists:
+
+- Some forges do not populate the `vars` context. An unset variable yields an
+  empty string rather than an error, so a variable you *did* set can silently
+  read as blank. If that happens, set the same value as a **secret** instead —
+  secrets are carried reliably. Its value is masked in the run log.
+- `GITHUB_SERVER_URL` is the **internal** origin on a proxied instance — an
+  address and port serving plain HTTP, not the public name. Pushing there fails
+  with `server gave HTTP response to HTTPS client` unless every daemon that
+  pulls has an `insecure-registries` entry. The resolve step warns when the host
+  it picked carries a port, which is the tell.
 
 Both behave identically. On every push to `main` they install, test, and publish
 `:main` plus an immutable `:sha-<short>` image. On a `v*` tag they additionally

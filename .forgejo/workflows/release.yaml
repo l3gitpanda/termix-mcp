@@ -99,25 +99,53 @@ jobs:
       - name: Check out current tree
         uses: https://data.forgejo.org/actions/checkout@v6
 
-      # The registry defaults to the forge this workflow is running on: a Forgejo
-      # instance doubles as a container registry, so a fork publishes to its own
-      # instance with nothing to configure. Set a REGISTRY repository variable
-      # only to publish somewhere else.
+      # Where to publish, in order: a REGISTRY repository variable, then a
+      # REGISTRY repository secret, then the forge this workflow runs on.
+      #
+      # The secret is not paranoia -- some forges do not populate the vars
+      # context at all, and an unset variable yields an empty string rather
+      # than an error, so a secret is the only channel that reliably carries
+      # a value on those instances.
+      #
+      # The forge fallback is last because GITHUB_SERVER_URL is the INTERNAL
+      # origin on a proxied instance -- an address and port that serves plain
+      # HTTP -- not the public name the registry is reachable at.
       #
       # Resolved in a step, not a workflow-level `env:`. The vars context is not
       # reliably populated there across forge versions, and when it is not, the
       # expression quietly yields an empty string -- which is how this used to
       # fall through to a placeholder and fail with the variable correctly set.
       - name: Resolve the registry and image
+        env:
+          REGISTRY_VAR: ${{ vars.REGISTRY }}
+          REGISTRY_SECRET: ${{ secrets.REGISTRY }}
         run: |
           set -eu
-          registry="${{ vars.REGISTRY }}"
-          if [ -n "$registry" ]; then
-            echo "REGISTRY variable is set: ${registry}"
-          else
-            registry="$(echo "${GITHUB_SERVER_URL}" | sed -e 's|^https://||' -e 's|^http://||' -e 's|/.*$||')"
-            echo "no REGISTRY variable; publishing to this forge: ${registry}"
+          registry="${REGISTRY_VAR:-}"
+          source="REGISTRY repository variable"
+          if [ -z "$registry" ]; then
+            registry="${REGISTRY_SECRET:-}"
+            source="REGISTRY repository secret (value masked in this log)"
           fi
+          if [ -z "$registry" ]; then
+            registry="$(echo "${GITHUB_SERVER_URL}" | sed -e 's|^https://||' -e 's|^http://||' -e 's|/.*$||')"
+            source="this forge, derived from GITHUB_SERVER_URL"
+          fi
+          echo "registry from ${source}: ${registry}"
+          case "$registry" in
+            *:*)
+              echo ""
+              echo "WARNING: that host carries a port, so it is almost certainly this"
+              echo "forge's INTERNAL origin rather than the name it is published under."
+              echo "A registry on a plain-HTTP origin needs an insecure-registries entry"
+              echo "on every daemon that pulls from it, and docker login will fail with"
+              echo "'server gave HTTP response to HTTPS client' if it has none."
+              echo ""
+              echo "Set the public HTTPS name as a REGISTRY repository variable, or as a"
+              echo "REGISTRY repository secret if variables are unavailable on this forge."
+              echo ""
+              ;;
+          esac
           # Registry paths must be lowercase; a repository name need not be.
           image="${registry}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
           echo "REGISTRY=${registry}" >> "$GITHUB_ENV"
@@ -279,25 +307,53 @@ jobs:
       - name: Check out current tree
         uses: https://data.forgejo.org/actions/checkout@v6
 
-      # The registry defaults to the forge this workflow is running on: a Forgejo
-      # instance doubles as a container registry, so a fork publishes to its own
-      # instance with nothing to configure. Set a REGISTRY repository variable
-      # only to publish somewhere else.
+      # Where to publish, in order: a REGISTRY repository variable, then a
+      # REGISTRY repository secret, then the forge this workflow runs on.
+      #
+      # The secret is not paranoia -- some forges do not populate the vars
+      # context at all, and an unset variable yields an empty string rather
+      # than an error, so a secret is the only channel that reliably carries
+      # a value on those instances.
+      #
+      # The forge fallback is last because GITHUB_SERVER_URL is the INTERNAL
+      # origin on a proxied instance -- an address and port that serves plain
+      # HTTP -- not the public name the registry is reachable at.
       #
       # Resolved in a step, not a workflow-level `env:`. The vars context is not
       # reliably populated there across forge versions, and when it is not, the
       # expression quietly yields an empty string -- which is how this used to
       # fall through to a placeholder and fail with the variable correctly set.
       - name: Resolve the registry and image
+        env:
+          REGISTRY_VAR: ${{ vars.REGISTRY }}
+          REGISTRY_SECRET: ${{ secrets.REGISTRY }}
         run: |
           set -eu
-          registry="${{ vars.REGISTRY }}"
-          if [ -n "$registry" ]; then
-            echo "REGISTRY variable is set: ${registry}"
-          else
-            registry="$(echo "${GITHUB_SERVER_URL}" | sed -e 's|^https://||' -e 's|^http://||' -e 's|/.*$||')"
-            echo "no REGISTRY variable; publishing to this forge: ${registry}"
+          registry="${REGISTRY_VAR:-}"
+          source="REGISTRY repository variable"
+          if [ -z "$registry" ]; then
+            registry="${REGISTRY_SECRET:-}"
+            source="REGISTRY repository secret (value masked in this log)"
           fi
+          if [ -z "$registry" ]; then
+            registry="$(echo "${GITHUB_SERVER_URL}" | sed -e 's|^https://||' -e 's|^http://||' -e 's|/.*$||')"
+            source="this forge, derived from GITHUB_SERVER_URL"
+          fi
+          echo "registry from ${source}: ${registry}"
+          case "$registry" in
+            *:*)
+              echo ""
+              echo "WARNING: that host carries a port, so it is almost certainly this"
+              echo "forge's INTERNAL origin rather than the name it is published under."
+              echo "A registry on a plain-HTTP origin needs an insecure-registries entry"
+              echo "on every daemon that pulls from it, and docker login will fail with"
+              echo "'server gave HTTP response to HTTPS client' if it has none."
+              echo ""
+              echo "Set the public HTTPS name as a REGISTRY repository variable, or as a"
+              echo "REGISTRY repository secret if variables are unavailable on this forge."
+              echo ""
+              ;;
+          esac
           # Registry paths must be lowercase; a repository name need not be.
           image="${registry}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
           echo "REGISTRY=${registry}" >> "$GITHUB_ENV"
