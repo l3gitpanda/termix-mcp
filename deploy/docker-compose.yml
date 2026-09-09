@@ -130,14 +130,19 @@ services:
       # default because the access policy's per-profile "mutations": "deny" is
       # the finer-grained control; this is the blunt one.
       #
-      # The reverse proxy's address. Without it every request arrives from the
-      # proxy as far as this server can tell, so the app log and every audit
-      # record attribute all activity to that one address and two holders of a
-      # token cannot be distinguished -- which is the first question asked when
-      # a token leaks. Set it to the proxy's address, and ONLY to hosts that really
-      # do front this service: the header is believed from these addresses.
-      # Empty by default -- trust nobody and record the socket peer.
-      TERMIX_TRUSTED_PROXIES: ${TERMIX_TRUSTED_PROXIES:-}
+      # TERMIX_TRUSTED_PROXIES belongs in the env_file above, NOT here. Without
+      # it every request arrives from the reverse proxy as far as this server
+      # can tell, so the app log and every audit record attribute all activity
+      # to that one address and two holders of a token cannot be distinguished
+      # -- the first question asked when a token leaks. Set it to the proxy's
+      # address, and ONLY to hosts that really do front this service: the header
+      # is believed from these addresses.
+      #
+      # Deliberately absent from this block: `environment:` overrides
+      # `env_file:`, so naming it here with a ${...} default would silently
+      # blank the env_file's value whenever the variable is unset in the .env
+      # beside this file -- fail-safe, but silent, and the audit trail would go
+      # back to attributing everything to the proxy with nothing to show why.
     ports:
       # Bind an explicit address rather than 0.0.0.0 on purpose: if the host is
       # ever re-IPed the container fails loudly instead of quietly listening on

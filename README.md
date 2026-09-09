@@ -253,14 +253,19 @@ source-of-truth compose. It needs an env_file holding `TERMIX_API_KEY` and
 `Authorization: Bearer <MCP_HTTP_TOKEN>`. `GET /healthz` is unauthenticated for
 the container probe.
 
-Nothing about one deployment is baked into that file. Three variables shape it,
-read from the `.env` beside it:
+Nothing about one deployment is baked into that file. Two variables shape the
+compose itself, read from the `.env` beside it:
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `MCP_IMAGE` | *(placeholder)* | The image to run. Set it to what your CI publishes |
 | `MCP_BIND_ADDR` | `127.0.0.1` | Address the published port binds to. Set it to this host's LAN address to reach the server from elsewhere |
-| `TERMIX_TRUSTED_PROXIES` | *(empty)* | Addresses whose `X-Forwarded-For` is believed. Set it **only** to proxies that really front this service |
+
+Everything the server itself reads — including `TERMIX_TRUSTED_PROXIES`, which
+you want set to your reverse proxy — goes in the `env_file`, not in the compose
+`environment:` block. Compose's `environment:` **overrides** `env_file:`, so a
+`${VAR:-}` entry there silently blanks the env file's value whenever the
+variable is missing from the `.env` beside the compose.
 
 `MCP_BIND_ADDR` defaults to loopback on purpose: publishing a port that can run
 commands on real servers should be a decision, not a default. Bind an explicit
