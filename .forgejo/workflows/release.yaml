@@ -13,18 +13,12 @@ concurrency:
   group: release-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: true
 
-env:
-  # Set a REGISTRY repository variable to your registry host -- a Forgejo
-  # instance doubles as one, and ghcr.io works too. The image path follows
-  # ${owner}/${repo}, so a fork needs no other edit. Left as a placeholder on
-  # purpose: a clone must not push images anywhere by accident, and the
-  # preflight below fails loudly while it is unset.
-  #
-  # Prefer reaching the registry through a TLS reverse proxy rather than the
-  # registry's plain-HTTP origin port -- then no daemon needs an
-  # insecure-registries entry. Registry hosts must be lowercase.
-  REGISTRY: ${{ vars.REGISTRY || 'registry.example.com' }}
-  IMAGE: ${{ vars.REGISTRY || 'registry.example.com' }}/${{ github.repository }}
+# REGISTRY and IMAGE are resolved per job in a "Resolve the registry and image"
+# step rather than here -- see the comment on that step for why.
+#
+# Prefer reaching the registry through a TLS reverse proxy rather than the
+# registry's plain-HTTP origin port, so no daemon needs an insecure-registries
+# entry.
 
 jobs:
   test:
@@ -105,6 +99,31 @@ jobs:
       - name: Check out current tree
         uses: https://data.forgejo.org/actions/checkout@v6
 
+      # The registry defaults to the forge this workflow is running on: a Forgejo
+      # instance doubles as a container registry, so a fork publishes to its own
+      # instance with nothing to configure. Set a REGISTRY repository variable
+      # only to publish somewhere else.
+      #
+      # Resolved in a step, not a workflow-level `env:`. The vars context is not
+      # reliably populated there across forge versions, and when it is not, the
+      # expression quietly yields an empty string -- which is how this used to
+      # fall through to a placeholder and fail with the variable correctly set.
+      - name: Resolve the registry and image
+        run: |
+          set -eu
+          registry="${{ vars.REGISTRY }}"
+          if [ -n "$registry" ]; then
+            echo "REGISTRY variable is set: ${registry}"
+          else
+            registry="$(echo "${GITHUB_SERVER_URL}" | sed -e 's|^https://||' -e 's|^http://||' -e 's|/.*$||')"
+            echo "no REGISTRY variable; publishing to this forge: ${registry}"
+          fi
+          # Registry paths must be lowercase; a repository name need not be.
+          image="${registry}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "REGISTRY=${registry}" >> "$GITHUB_ENV"
+          echo "IMAGE=${image}" >> "$GITHUB_ENV"
+          echo "publishing to ${image}"
+
       - name: Ensure a Docker CLI is available
         run: |
           set -eu
@@ -150,12 +169,6 @@ jobs:
             exit 1
           fi
           echo "daemon ok: $(docker version --format '{{.Server.Version}}')"
-          if [ "${REGISTRY}" = "registry.example.com" ]; then
-            echo "REGISTRY is still the placeholder, so there is nowhere to publish. Add a"
-            echo "repository variable named REGISTRY holding your registry host, for example"
-            echo "git.example.com or ghcr.io."
-            exit 1
-          fi
           if [ -z "${TOKEN:-}" ]; then
             echo "PACKAGERUNNER_TOKEN is not set for this repository. Forgejo's automatic Actions"
             echo "token cannot write packages. Create a user access token with package read/write"
@@ -265,6 +278,31 @@ jobs:
     steps:
       - name: Check out current tree
         uses: https://data.forgejo.org/actions/checkout@v6
+
+      # The registry defaults to the forge this workflow is running on: a Forgejo
+      # instance doubles as a container registry, so a fork publishes to its own
+      # instance with nothing to configure. Set a REGISTRY repository variable
+      # only to publish somewhere else.
+      #
+      # Resolved in a step, not a workflow-level `env:`. The vars context is not
+      # reliably populated there across forge versions, and when it is not, the
+      # expression quietly yields an empty string -- which is how this used to
+      # fall through to a placeholder and fail with the variable correctly set.
+      - name: Resolve the registry and image
+        run: |
+          set -eu
+          registry="${{ vars.REGISTRY }}"
+          if [ -n "$registry" ]; then
+            echo "REGISTRY variable is set: ${registry}"
+          else
+            registry="$(echo "${GITHUB_SERVER_URL}" | sed -e 's|^https://||' -e 's|^http://||' -e 's|/.*$||')"
+            echo "no REGISTRY variable; publishing to this forge: ${registry}"
+          fi
+          # Registry paths must be lowercase; a repository name need not be.
+          image="${registry}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "REGISTRY=${registry}" >> "$GITHUB_ENV"
+          echo "IMAGE=${image}" >> "$GITHUB_ENV"
+          echo "publishing to ${image}"
 
       - name: Build the release payloads
         run: |

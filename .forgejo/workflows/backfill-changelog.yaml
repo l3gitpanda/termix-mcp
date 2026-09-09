@@ -33,9 +33,9 @@ jobs:
           # cannot write releases reliably here, which is why this is not
           # secrets.GITHUB_TOKEN.
           TOKEN: ${{ secrets.PACKAGERUNNER_TOKEN || secrets.GITHUB_TOKEN }}
-          # Same placeholder rule as the release workflow: set a REGISTRY
-          # repository variable. Only used to render the pull line in bodies.
-          IMAGE: ${{ vars.REGISTRY || 'registry.example.com' }}/${{ github.repository }}
+          # Resolved in the script below, the same way the release workflow does
+          # it. Only used to render the pull line in release bodies.
+          REGISTRY_VAR: ${{ vars.REGISTRY }}
           APPLY: ${{ inputs.apply == 'true' && '1' || '0' }}
         run: |
           set -eu
@@ -44,4 +44,11 @@ jobs:
             echo "with release write scope -- the same one the release job uses."
             exit 1
           fi
+          registry="${REGISTRY_VAR:-}"
+          if [ -z "$registry" ]; then
+            registry="$(echo "${GITHUB_SERVER_URL}" | sed -e 's|^https://||' -e 's|^http://||' -e 's|/.*$||')"
+          fi
+          IMAGE="${registry}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          export IMAGE
+          echo "rendering pull lines for ${IMAGE}"
           node scripts/backfill-releases.mjs

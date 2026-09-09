@@ -299,18 +299,21 @@ prefers `.forgejo/workflows` when it is present.
 | | GitHub | Forgejo |
 |---|---|---|
 | Workflow | `.github/workflows/release.yml` | `.forgejo/workflows/release.yaml` |
-| Registry | `ghcr.io/<owner>/<repo>` | the `REGISTRY` repository variable |
+| Registry | `ghcr.io/<owner>/<repo>` | the Forgejo instance itself |
 | Credential | the built-in `GITHUB_TOKEN` | a `PACKAGERUNNER_TOKEN` secret |
-| Setup | none | set `REGISTRY`, add the secret |
+| Setup | none | add the secret |
 
 **On GitHub** nothing needs configuring: the workflow publishes to GHCR with the
 token Actions already provides. Note that a package published this way starts
 **private** — make it public from the package's settings page if you want others
 to pull it.
 
-**On Forgejo** set a `REGISTRY` repository variable to your registry host before
-the first release; the image path follows `<owner>/<repo>`. Until it is set, the
-release job stops at a preflight rather than pushing to a placeholder host.
+**On Forgejo** the registry defaults to the instance the workflow is running on,
+since a Forgejo instance doubles as a container registry. The image lands at
+`<your-forge>/<owner>/<repo>` with nothing to configure. Set a `REGISTRY`
+repository variable only to publish somewhere else — and note it is read in a
+job step rather than a workflow-level `env:`, because the `vars` context is not
+reliably populated there and yields an empty string when it is not.
 
 Both behave identically. On every push to `main` they install, test, and publish
 `:main` plus an immutable `:sha-<short>` image. On a `v*` tag they additionally
